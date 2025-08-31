@@ -13,6 +13,7 @@ import zipfile
 import shutil
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -95,6 +96,7 @@ def file_kind(path: str) -> str:
 # --------------------------------- Scanner -------------------------------------
 
 def sha256_file(path: str, stop_event: threading.Event, chunk_size: int = 1024 * 1024) -> Optional[str]:
+    """Compute SHA-256 in chunks; return None if canceled or unreadable."""
     h = hashlib.sha256()
     try:
         with open(path, "rb") as f:
@@ -114,13 +116,17 @@ def safe_os_walk(root: str):
 
 
 class ScanWorker(threading.Thread):
-    """Walks folders (and optional ZIPs), groups by size, confirms duplicates by SHA-256."""
-    def __init__(self, root_dir: str, out_q: queue.Queue, stop_event: threading.Event, scan_zip: bool):
+    """
+    Walks folders (and optional ZIPs), groups by size, then hashes IN PARALLEL to
+    confirm true duplicates by SHA-256. Sends status/progress/results via out_q.
+    """
+    def __init__(self, root_dir: str, out_q: queue.Queue, stop_event: threading.Event, scan_zip: bool, max_workers: int):
         super().__init__(daemon=True)
         self.root_dir = root_dir
         self.out_q = out_q
         self.stop_event = stop_event
         self.scan_zip = scan_zip
+        self.max_workers = max(1, int(max_workers))
         self.temp_dir: Optional[str] = None
 
     def _log(self, msg: str):
@@ -186,12 +192,14 @@ class ScanWorker(threading.Thread):
 
             self.out_q.put(("status", f"Found {len(candidates):,} files. Grouping by size…"))
 
+            # Group by size
             by_size: Dict[int, List[FileInfo]] = {}
             for fi in candidates:
                 by_size.setdefault(fi.size, []).append(fi)
 
             collision_groups = [g for g in by_size.values() if len(g) > 1]
-            total_to_hash = sum(len(g) for g in collision_groups)
+            to_hash: List[FileInfo] = [fi for group in collision_groups for fi in group]
+            total_to_hash = len(to_hash)
 
             if total_to_hash == 0:
                 self.out_q.put(("done", []))
@@ -199,25 +207,42 @@ class ScanWorker(threading.Thread):
                 return
 
             self.out_q.put(("progress_max", total_to_hash))
-            self.out_q.put(("status", f"Hashing {total_to_hash:,} candidate files…"))
+            self._log(f"Hashing with {self.max_workers} thread(s)…")
+            self.out_q.put(("status", f"Hashing {total_to_hash:,} candidate files using {self.max_workers} threads…"))
 
-            hashed = 0
+            # ---- Parallel hashing ----
             by_hash: Dict[str, List[FileInfo]] = {}
-            for group in collision_groups:
-                for fi in group:
+            hashed = 0
+            report_every = max(10, total_to_hash // 100)  # update ~1% or at least every 10
+
+            # Map futures to FileInfo so we know which file finished.
+            def submit_hash(executor: ThreadPoolExecutor, fi: FileInfo):
+                return executor.submit(sha256_file, fi.path, self.stop_event)
+
+            with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
+                future_map = {submit_hash(ex, fi): fi for fi in to_hash}
+                for fut in as_completed(future_map):
                     if self.stop_event.is_set():
-                        self.out_q.put(("status", "Scan canceled."))
-                        return
-                    digest = sha256_file(fi.path, self.stop_event)
-                    if digest is None:
-                        continue
-                    fi.sha256 = digest
-                    by_hash.setdefault(digest, []).append(fi)
+                        break
+                    fi = future_map[fut]
+                    digest = None
+                    try:
+                        digest = fut.result()
+                    except Exception:
+                        digest = None
+                    if digest:
+                        fi.sha256 = digest
+                        by_hash.setdefault(digest, []).append(fi)
                     hashed += 1
-                    if hashed % 10 == 0 or hashed == total_to_hash:
+                    if hashed % report_every == 0 or hashed == total_to_hash:
                         self.out_q.put(("progress", hashed))
                         self.out_q.put(("status", f"Hashing… {hashed:,}/{total_to_hash:,}"))
 
+            if self.stop_event.is_set():
+                self.out_q.put(("status", "Scan canceled."))
+                return
+
+            # Build duplicate sets
             dup_sets: List[DuplicateSet] = []
             for digest, files in by_hash.items():
                 if len(files) > 1:
@@ -240,7 +265,7 @@ class ScanWorker(threading.Thread):
 class DuplicateMediaFocusedApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Duplicate File Cleaner — Media-Focused (SHA-256)")
+        self.root.title("Duplicate File Cleaner — Media-Focused (SHA-256, Multithreaded)")
         self.root.geometry("1200x760")
         self.root.minsize(960, 640)
 
@@ -259,8 +284,10 @@ class DuplicateMediaFocusedApp:
         self.stop_event = threading.Event()
         self.worker: Optional[ScanWorker] = None
 
-        self.auto_scan_var = tk.BooleanVar(value=True)   # NEW: auto-start scan on folder select
-        self.media_only_var = tk.BooleanVar(value=False) # show all by default
+        default_threads = min(8, (os.cpu_count() or 4) * 2)  # good default for SSDs
+        self.threads_var = tk.IntVar(value=default_threads)
+        self.auto_scan_var = tk.BooleanVar(value=True)
+        self.media_only_var = tk.BooleanVar(value=False)
         self.scan_zip_var = tk.BooleanVar(value=False)
 
         self.dup_sets: List[DuplicateSet] = []
@@ -282,7 +309,6 @@ class DuplicateMediaFocusedApp:
         top = ttk.Frame(self.root, padding=(12, 10, 12, 6))
         top.pack(side=tk.TOP, fill=tk.X)
 
-        # Left: folder + immediate Scan/Stop (so they’re always visible)
         left = ttk.Frame(top)
         left.pack(side=tk.LEFT)
         ttk.Button(left, text="Select Folder…", command=self.on_browse).pack(side=tk.LEFT)
@@ -293,14 +319,20 @@ class DuplicateMediaFocusedApp:
         self.btn_stop = ttk.Button(left, text="Stop", command=self.on_stop, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=(6, 0))
 
-        # Right: options
         right = ttk.Frame(top)
         right.pack(side=tk.RIGHT)
+
+        # NEW: thread count control
+        ttk.Label(right, text="Threads:", style="Small.TLabel").pack(side=tk.RIGHT, padx=(8, 4))
+        self.threads_spin = ttk.Spinbox(
+            right, from_=1, to=64, width=4, textvariable=self.threads_var, justify="center"
+        )
+        self.threads_spin.pack(side=tk.RIGHT, padx=(0, 12))
+
         ttk.Checkbutton(right, text="Auto-scan on select", variable=self.auto_scan_var).pack(side=tk.RIGHT, padx=(8, 8))
         ttk.Checkbutton(right, text="Scan inside ZIPs", variable=self.scan_zip_var).pack(side=tk.RIGHT, padx=(0, 12))
         ttk.Checkbutton(right, text="Show only image/video sets", variable=self.media_only_var, command=self._rebuild_tree).pack(side=tk.RIGHT)
 
-        # Counts line
         counts = ttk.Frame(self.root, padding=(12, 0, 12, 4))
         counts.pack(fill=tk.X)
         self.count_label = ttk.Label(counts, text="Sets: 0 • Media sets: 0 • Hidden by filter: 0", style="Small.TLabel")
@@ -319,16 +351,15 @@ class DuplicateMediaFocusedApp:
 
         columns = ("idx","count","types","digest","keeper")
         self.tree = ttk.Treeview(left, columns=columns, show="headings", height=22)
-        self.tree.heading("idx", text="#")
-        self.tree.heading("count", text="Files")
-        self.tree.heading("types", text="Types")
-        self.tree.heading("digest", text="SHA-256 (short)")
-        self.tree.heading("keeper", text="Keeper (most recent)")
-        self.tree.column("idx", width=40, anchor="center")
-        self.tree.column("count", width=60, anchor="e")
-        self.tree.column("types", width=90, anchor="center")
-        self.tree.column("digest", width=220, anchor="w")
-        self.tree.column("keeper", width=520, anchor="w")
+        for cid, title, width, anchor in [
+            ("idx","#",40,"center"),
+            ("count","Files",60,"e"),
+            ("types","Types",90,"center"),
+            ("digest","SHA-256 (short)",220,"w"),
+            ("keeper","Keeper (most recent)",520,"w"),
+        ]:
+            self.tree.heading(cid, text=title)
+            self.tree.column(cid, width=width, anchor=anchor)
         yscroll = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=yscroll.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH)
@@ -362,12 +393,10 @@ class DuplicateMediaFocusedApp:
         self.canvas.configure(yscrollcommand=scroll_y.set)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
-
         def _wheel(e): self.canvas.yview_scroll(int(-1*(e.delta/120)), "units")
         self.canvas.bind_all("<MouseWheel>", _wheel)
         self.canvas.bind_all("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))
         self.canvas.bind_all("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))
-
         self.detail_container = inner
 
         # Log area
@@ -407,8 +436,9 @@ class DuplicateMediaFocusedApp:
         self.btn_scan.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
         self.stop_event.clear()
-        self._log_ui(f"Scan started in: {self.selected_dir} | scan ZIPs: {self.scan_zip_var.get()}")
-        self.worker = ScanWorker(self.selected_dir, self.out_q, self.stop_event, self.scan_zip_var.get())
+        threads = max(1, int(self.threads_var.get()))
+        self._log_ui(f"Scan started in: {self.selected_dir} | ZIPs: {self.scan_zip_var.get()} | Threads: {threads}")
+        self.worker = ScanWorker(self.selected_dir, self.out_q, self.stop_event, self.scan_zip_var.get(), threads)
         self.worker.start()
 
     def on_stop(self):
