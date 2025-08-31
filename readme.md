@@ -1,0 +1,1 @@
+pip install pillow opencv-python Send2Trash
