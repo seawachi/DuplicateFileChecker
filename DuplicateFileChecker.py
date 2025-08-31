@@ -46,6 +46,7 @@ class FileInfo:
     size: int
     mtime: float
     sha256: Optional[str] = None
+    qhash: Optional[str] = None  # quick fingerprint
 
     def pretty_mtime(self) -> str:
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.mtime))
@@ -65,6 +66,7 @@ class DuplicateSet:
 
     @property
     def keeper(self) -> FileInfo:
+        # Keep most recent
         return max(self.files, key=lambda f: f.mtime)
 
     def others(self) -> List[FileInfo]:
@@ -93,10 +95,13 @@ def file_kind(path: str) -> str:
     return "other"
 
 
-# --------------------------------- Scanner -------------------------------------
+# --------------------------------- Hashing -------------------------------------
 
-def sha256_file(path: str, stop_event: threading.Event, chunk_size: int = 1024 * 1024) -> Optional[str]:
-    """Compute SHA-256 in chunks; return None if canceled or unreadable."""
+def sha256_file(path: str, stop_event: threading.Event, chunk_size: int = 4 * 1024 * 1024) -> Optional[str]:
+    """
+    Compute SHA-256 in chunks; return None if canceled/unreadable.
+    Larger chunk_size reduces Python overhead and usually speeds up SSDs.
+    """
     h = hashlib.sha256()
     try:
         with open(path, "rb") as f:
@@ -104,23 +109,54 @@ def sha256_file(path: str, stop_event: threading.Event, chunk_size: int = 1024 *
                 if stop_event.is_set():
                     return None
                 b = f.read(chunk_size)
-                if not b: break
+                if not b:
+                    break
                 h.update(b)
         return h.hexdigest()
     except Exception:
         return None
+
+
+def quick_fingerprint(path: str, stop_event: threading.Event, head_bytes: int = 256 * 1024) -> Optional[str]:
+    """
+    Fast content fingerprint based on head+tail bytes.
+    Safe optimization: ONLY partitions candidates; final equality uses full SHA-256.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if stop_event.is_set():
+                return None
+            if size <= head_bytes * 2:
+                data = f.read()
+                return hashlib.blake2b(data, digest_size=16).hexdigest()
+            head = f.read(head_bytes)
+            if stop_event.is_set():
+                return None
+            f.seek(-head_bytes, os.SEEK_END)
+            tail = f.read(head_bytes)
+        return hashlib.blake2b(head + tail, digest_size=16).hexdigest()
+    except Exception:
+        return None
+
 
 def safe_os_walk(root: str):
     for dirpath, dirnames, filenames in os.walk(root):
         yield dirpath, dirnames, filenames
 
 
+# --------------------------------- Worker --------------------------------------
+
 class ScanWorker(threading.Thread):
     """
-    Walks folders (and optional ZIPs), groups by size, then hashes IN PARALLEL to
-    confirm true duplicates by SHA-256. Sends status/progress/results via out_q.
+    Walks folders (and optional ZIPs), then:
+      1) group by file size
+      2) compute quick fingerprints in parallel to prune
+      3) compute full SHA-256 in parallel to confirm TRUE duplicates
+    Sends status/progress/results via out_q.
     """
-    def __init__(self, root_dir: str, out_q: queue.Queue, stop_event: threading.Event, scan_zip: bool, max_workers: int):
+    def __init__(self, root_dir: str, out_q: queue.Queue, stop_event: threading.Event,
+                 scan_zip: bool, max_workers: int):
         super().__init__(daemon=True)
         self.root_dir = root_dir
         self.out_q = out_q
@@ -129,9 +165,11 @@ class ScanWorker(threading.Thread):
         self.max_workers = max(1, int(max_workers))
         self.temp_dir: Optional[str] = None
 
-    def _log(self, msg: str):
-        self.out_q.put(("log", msg))
+    # ----- messaging helpers -----
+    def _status(self, msg: str): self.out_q.put(("status", msg))
+    def _log(self, msg: str): self.out_q.put(("log", msg))
 
+    # ----- zip expansion -----
     def _maybe_expand_zips(self) -> List[str]:
         roots = [self.root_dir]
         if not self.scan_zip:
@@ -156,95 +194,119 @@ class ScanWorker(threading.Thread):
             self._log(f"ZIP setup error: {e}")
         return roots
 
+    # ----- main -----
     def run(self):
         try:
-            self.out_q.put(("status", f"Scanning: {self.root_dir}"))
+            self._status(f"Scanning: {self.root_dir}")
             roots = self._maybe_expand_zips()
 
+            # 1) Collect candidates
             candidates: List[FileInfo] = []
             visited = 0
-            skipped_perm = 0
+            denied = 0
 
             for root in roots:
                 for dirpath, _, filenames in safe_os_walk(root):
                     for name in filenames:
                         if self.stop_event.is_set():
-                            self.out_q.put(("status", "Scan canceled."))
+                            self._status("Scan canceled.")
                             return
                         visited += 1
                         if visited % 500 == 0:
-                            self.out_q.put(("status", f"Scanning… visited {visited:,} files"))
+                            self._status(f"Scanning… visited {visited:,} files")
                         path = os.path.join(dirpath, name)
                         try:
                             st = os.stat(path)
                             candidates.append(FileInfo(path=path, size=st.st_size, mtime=st.st_mtime))
                         except PermissionError:
-                            skipped_perm += 1
+                            denied += 1
                         except Exception:
                             pass
 
-            self._log(f"Visited files: {visited:,} | Readable: {len(candidates):,} | Permission-denied: {skipped_perm:,}")
-
+            self._log(f"Visited: {visited:,} | Readable: {len(candidates):,} | Permission-denied: {denied:,}")
             if not candidates:
                 self.out_q.put(("done", []))
-                self.out_q.put(("status", "No readable files found."))
+                self._status("No readable files found.")
                 return
 
-            self.out_q.put(("status", f"Found {len(candidates):,} files. Grouping by size…"))
-
-            # Group by size
+            # 2) Group by size
+            self._status(f"Found {len(candidates):,} files. Grouping by size…")
             by_size: Dict[int, List[FileInfo]] = {}
             for fi in candidates:
                 by_size.setdefault(fi.size, []).append(fi)
 
-            collision_groups = [g for g in by_size.values() if len(g) > 1]
-            to_hash: List[FileInfo] = [fi for group in collision_groups for fi in group]
-            total_to_hash = len(to_hash)
-
-            if total_to_hash == 0:
+            size_groups = [g for g in by_size.values() if len(g) > 1]
+            if not size_groups:
                 self.out_q.put(("done", []))
-                self.out_q.put(("status", "No duplicate-sized files found."))
+                self._status("No duplicate-sized files found.")
                 return
 
-            self.out_q.put(("progress_max", total_to_hash))
-            self._log(f"Hashing with {self.max_workers} thread(s)…")
-            self.out_q.put(("status", f"Hashing {total_to_hash:,} candidate files using {self.max_workers} threads…"))
+            # 3) Quick fingerprint (parallel): reduce full-hash work
+            q_candidates = [fi for grp in size_groups for fi in grp]
+            self._status(f"Quick fingerprinting {len(q_candidates):,} files using {self.max_workers} threads…")
+            self.out_q.put(("progress_max", len(q_candidates)))
 
-            # ---- Parallel hashing ----
-            by_hash: Dict[str, List[FileInfo]] = {}
+            hashed_q = 0
+            report_every_q = max(10, len(q_candidates) // 100)
+
+            def qtask(fi: FileInfo) -> Tuple[FileInfo, Optional[str]]:
+                return fi, quick_fingerprint(fi.path, self.stop_event)
+
+            by_qhash: Dict[Tuple[int, str], List[FileInfo]] = {}
+            with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
+                futmap = {ex.submit(qtask, fi): fi for fi in q_candidates}
+                for fut in as_completed(futmap):
+                    if self.stop_event.is_set():
+                        self._status("Scan canceled.")
+                        return
+                    fi, qh = fut.result()
+                    if qh:
+                        fi.qhash = qh
+                        by_qhash.setdefault((fi.size, qh), []).append(fi)
+                    hashed_q += 1
+                    if hashed_q % report_every_q == 0 or hashed_q == len(q_candidates):
+                        self.out_q.put(("progress", hashed_q))
+                        self._status(f"Quick pass… {hashed_q:,}/{len(q_candidates):,}")
+
+            # 4) Full SHA-256 only where quick hash collides
+            full_list: List[FileInfo] = []
+            for (_size, _qh), files in by_qhash.items():
+                if len(files) > 1:
+                    full_list.extend(files)
+
+            if not full_list:
+                self.out_q.put(("done", []))
+                self._status("No duplicates after quick pass.")
+                return
+
+            self._status(f"Confirming duplicates (SHA-256) on {len(full_list):,} files…")
+            self.out_q.put(("progress_max", len(full_list)))
+
+            by_sha: Dict[str, List[FileInfo]] = {}
             hashed = 0
-            report_every = max(10, total_to_hash // 100)  # update ~1% or at least every 10
+            report_every = max(10, len(full_list) // 100)
 
-            # Map futures to FileInfo so we know which file finished.
-            def submit_hash(executor: ThreadPoolExecutor, fi: FileInfo):
-                return executor.submit(sha256_file, fi.path, self.stop_event)
+            def stag(fi: FileInfo) -> Tuple[FileInfo, Optional[str]]:
+                return fi, sha256_file(fi.path, self.stop_event)
 
             with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
-                future_map = {submit_hash(ex, fi): fi for fi in to_hash}
-                for fut in as_completed(future_map):
+                futmap = {ex.submit(stag, fi): fi for fi in full_list}
+                for fut in as_completed(futmap):
                     if self.stop_event.is_set():
-                        break
-                    fi = future_map[fut]
-                    digest = None
-                    try:
-                        digest = fut.result()
-                    except Exception:
-                        digest = None
+                        self._status("Scan canceled.")
+                        return
+                    fi, digest = fut.result()
                     if digest:
                         fi.sha256 = digest
-                        by_hash.setdefault(digest, []).append(fi)
+                        by_sha.setdefault(digest, []).append(fi)
                     hashed += 1
-                    if hashed % report_every == 0 or hashed == total_to_hash:
+                    if hashed % report_every == 0 or hashed == len(full_list):
                         self.out_q.put(("progress", hashed))
-                        self.out_q.put(("status", f"Hashing… {hashed:,}/{total_to_hash:,}"))
+                        self._status(f"Hashing… {hashed:,}/{len(full_list):,}")
 
-            if self.stop_event.is_set():
-                self.out_q.put(("status", "Scan canceled."))
-                return
-
-            # Build duplicate sets
+            # 5) Build duplicate sets (true duplicates only)
             dup_sets: List[DuplicateSet] = []
-            for digest, files in by_hash.items():
+            for digest, files in by_sha.items():
                 if len(files) > 1:
                     files.sort(key=lambda f: f.mtime, reverse=True)
                     dup_sets.append(DuplicateSet(digest=digest, files=files))
@@ -253,9 +315,9 @@ class ScanWorker(threading.Thread):
 
             if self.temp_dir:
                 self.out_q.put(("tempdir", self.temp_dir))
-
             self.out_q.put(("done", dup_sets))
-            self.out_q.put(("status", f"Completed. Duplicate sets: {len(dup_sets)}"))
+            self._status(f"Completed. Duplicate sets: {len(dup_sets)}")
+
         except Exception as e:
             self.out_q.put(("error", f"{e}\n{traceback.format_exc()}"))
 
@@ -265,9 +327,9 @@ class ScanWorker(threading.Thread):
 class DuplicateMediaFocusedApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Duplicate File Cleaner — Media-Focused (SHA-256, Multithreaded)")
-        self.root.geometry("1200x760")
-        self.root.minsize(960, 640)
+        self.root.title("Duplicate File Cleaner — Fast & Safe (SHA-256, Multithreaded)")
+        self.root.geometry("1400x760")
+        self.root.minsize(980, 640)
 
         style = ttk.Style(self.root)
         try: style.theme_use("clam")
@@ -284,7 +346,8 @@ class DuplicateMediaFocusedApp:
         self.stop_event = threading.Event()
         self.worker: Optional[ScanWorker] = None
 
-        default_threads = min(8, (os.cpu_count() or 4) * 2)  # good default for SSDs
+        # aggressive default threads (IO-bound): up to 32 or 4× CPUs
+        default_threads = min(32, (os.cpu_count() or 4) * 4)
         self.threads_var = tk.IntVar(value=default_threads)
         self.auto_scan_var = tk.BooleanVar(value=True)
         self.media_only_var = tk.BooleanVar(value=False)
@@ -297,7 +360,12 @@ class DuplicateMediaFocusedApp:
         self.check_vars: Dict[str, tk.BooleanVar] = {}
         self.temp_dirs: List[str] = []
 
+        # references for new quick-prune bar buttons
+        self.btn_bulk_del_all = None
+        self.btn_bulk_del_set = None
+
         self._build_topbar()
+        self._build_quick_prune_bar()  # <-- NEW section under the Select Folder bar
         self._build_body()
         self._build_statusbar()
 
@@ -322,11 +390,8 @@ class DuplicateMediaFocusedApp:
         right = ttk.Frame(top)
         right.pack(side=tk.RIGHT)
 
-        # NEW: thread count control
         ttk.Label(right, text="Threads:", style="Small.TLabel").pack(side=tk.RIGHT, padx=(8, 4))
-        self.threads_spin = ttk.Spinbox(
-            right, from_=1, to=64, width=4, textvariable=self.threads_var, justify="center"
-        )
+        self.threads_spin = ttk.Spinbox(right, from_=1, to=128, width=4, textvariable=self.threads_var, justify="center")
         self.threads_spin.pack(side=tk.RIGHT, padx=(0, 12))
 
         ttk.Checkbutton(right, text="Auto-scan on select", variable=self.auto_scan_var).pack(side=tk.RIGHT, padx=(8, 8))
@@ -340,11 +405,38 @@ class DuplicateMediaFocusedApp:
         self.banner = ttk.Label(self.root, text="", foreground="#b26b00", style="Small.TLabel")
         self.banner.pack(fill=tk.X, padx=12)
 
+    def _build_quick_prune_bar(self):
+        """
+        A pinned bar directly under the Select Folder area with two big buttons:
+        - Delete Selected Set (keep latest)
+        - Delete All Sets (keep latest)
+        """
+        bar = ttk.Frame(self.root, padding=(12, 0, 12, 6))
+        bar.pack(fill=tk.X)
+
+        ttk.Label(bar, text="Quick Prune:", style="Small.TLabel").pack(side=tk.LEFT)
+
+        # Right-aligned button cluster
+        cluster = ttk.Frame(bar)
+        cluster.pack(side=tk.RIGHT)
+
+        self.btn_bulk_del_all = ttk.Button(
+            cluster, text="Delete All Sets (keep latest)", style="Danger.TButton",
+            command=self.on_delete_all_sets_keep_latest, state=tk.DISABLED
+        )
+        self.btn_bulk_del_all.pack(side=tk.RIGHT, padx=(6, 0))
+
+        self.btn_bulk_del_set = ttk.Button(
+            cluster, text="Delete Selected Set (keep latest)", style="Danger.TButton",
+            command=self.on_delete_this_set_keep_latest, state=tk.DISABLED
+        )
+        self.btn_bulk_del_set.pack(side=tk.RIGHT)
+
     def _build_body(self):
         body = ttk.Frame(self.root, padding=(12, 0, 12, 0))
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        # Left list
+        # ---------------- Left list (duplicate sets) ----------------
         left = ttk.Frame(body)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=False)
         ttk.Label(left, text="Duplicate Sets", style="Header.TLabel").pack(anchor="w", pady=(6, 6))
@@ -356,33 +448,51 @@ class DuplicateMediaFocusedApp:
             ("count","Files",60,"e"),
             ("types","Types",90,"center"),
             ("digest","SHA-256 (short)",220,"w"),
-            ("keeper","Keeper (most recent)",520,"w"),
+            ("keeper","Keeper (most recent)",320,"w"),
         ]:
             self.tree.heading(cid, text=title)
             self.tree.column(cid, width=width, anchor=anchor)
+
         yscroll = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=yscroll.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH)
         yscroll.pack(side=tk.LEFT, fill=tk.Y)
         self.tree.bind("<<TreeviewSelect>>", self.on_select_set)
 
-        # Right panel
+        # ---------------- Right panel ----------------
         right = ttk.Frame(body)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
-        ttk.Label(right, text="Preview & Delete (media-focused)", style="Header.TLabel").pack(anchor="w", pady=(6,6))
 
-        actionbar = ttk.Frame(right)
-        actionbar.pack(fill=tk.X, pady=(0, 6))
+        # Header row with title (left) + actions (right) pinned above the scroll area
+        header = ttk.Frame(right)
+        header.pack(fill=tk.X, pady=(6, 6))
+
+        ttk.Label(header, text="Preview & Delete (media-focused)", style="Header.TLabel")\
+            .pack(side=tk.LEFT)
+
+        header_actions = ttk.Frame(header)
+        header_actions.pack(side=tk.RIGHT)
+
+        # Recycle bin toggle
         self.recycle_var = tk.BooleanVar(value=SEND2TRASH_AVAILABLE)
-        rec = ttk.Checkbutton(actionbar, text="Use Recycle Bin (Send2Trash)", variable=self.recycle_var)
-        if not SEND2TRASH_AVAILABLE: rec.state(["disabled"])
-        ttk.Button(actionbar, text="Select All", command=self.on_select_all).pack(side=tk.RIGHT)
-        ttk.Button(actionbar, text="Select None", command=self.on_select_none).pack(side=tk.RIGHT)
-        ttk.Button(actionbar, text="Select All Except Latest", command=self.on_select_all_but_keeper).pack(side=tk.RIGHT, padx=(6,0))
-        ttk.Button(actionbar, text="Delete Selected", style="Danger.TButton", command=self.on_delete_selected).pack(side=tk.RIGHT, padx=(6,0))
-        rec.pack(side=tk.LEFT)
+        rec = ttk.Checkbutton(header_actions, text="Use Recycle Bin", variable=self.recycle_var)
+        if not SEND2TRASH_AVAILABLE:
+            rec.state(["disabled"])
+        rec.pack(side=tk.LEFT, padx=(0, 10))
 
-        # Scrollable preview area
+        # Action buttons from right to left (dangerous actions on the far right)
+        ttk.Button(header_actions, text="Delete Selected", style="Danger.TButton",
+                   command=self.on_delete_selected).pack(side=tk.RIGHT, padx=(3,0))
+        ttk.Button(header_actions, text="Select All Except Latest",
+                   command=self.on_select_all_but_keeper).pack(side=tk.RIGHT, padx=(3,0))
+        ttk.Button(header_actions, text="Select None",
+                   command=self.on_select_none).pack(side=tk.RIGHT)
+        ttk.Button(header_actions, text="Select All",
+                   command=self.on_select_all).pack(side=tk.RIGHT)
+
+        ttk.Separator(right, orient="horizontal").pack(fill=tk.X, pady=(0, 4))
+
+        # Scrollable preview area (only this part scrolls)
         vp = ttk.Frame(right)
         vp.pack(fill=tk.BOTH, expand=True)
         self.canvas = tk.Canvas(vp, borderwidth=0, highlightthickness=0)
@@ -393,15 +503,18 @@ class DuplicateMediaFocusedApp:
         self.canvas.configure(yscrollcommand=scroll_y.set)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Mouse wheel support
         def _wheel(e): self.canvas.yview_scroll(int(-1*(e.delta/120)), "units")
         self.canvas.bind_all("<MouseWheel>", _wheel)
-        self.canvas.bind_all("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))
-        self.canvas.bind_all("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))
+        self.canvas.bind_all("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))  # Linux
+        self.canvas.bind_all("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))   # Linux
+
         self.detail_container = inner
 
         # Log area
         log_frame = ttk.Frame(right)
-        log_frame.pack(fill=tk.X, pady=(4,8))
+        log_frame.pack(fill=tk.X, pady=(4, 8))
         ttk.Label(log_frame, text="Log:", style="Small.TLabel").pack(anchor="w")
         self.log_text = tk.Text(log_frame, height=6, wrap="word")
         self.log_text.configure(state="disabled")
@@ -436,6 +549,7 @@ class DuplicateMediaFocusedApp:
         self.btn_scan.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
         self.stop_event.clear()
+        self._set_quick_prune_enabled(False, False)
         threads = max(1, int(self.threads_var.get()))
         self._log_ui(f"Scan started in: {self.selected_dir} | ZIPs: {self.scan_zip_var.get()} | Threads: {threads}")
         self.worker = ScanWorker(self.selected_dir, self.out_q, self.stop_event, self.scan_zip_var.get(), threads)
@@ -451,14 +565,19 @@ class DuplicateMediaFocusedApp:
 
     def on_select_set(self, _evt):
         sel = self.tree.selection()
-        if not sel: return
+        if not sel:
+            self.current_set_index = None
+            self._set_quick_prune_enabled(bool(self.dup_sets), False)
+            return
         try:
             idx = int(self.tree.item(sel[0], "values")[0]) - 1
         except Exception:
+            self._set_quick_prune_enabled(bool(self.dup_sets), False)
             return
         if 0 <= idx < len(self.view_sets):
             self.current_set_index = idx
             self._render_detail(self.view_sets[idx])
+            self._set_quick_prune_enabled(True, True)
 
     def on_select_all(self):
         for v in self.check_vars.values(): v.set(True)
@@ -479,13 +598,64 @@ class DuplicateMediaFocusedApp:
         if not to_delete:
             messagebox.showinfo("Nothing selected", "Select one or more files to delete.")
             return
-        msg = "You're about to delete:\n\n" + "\n".join(f"• {p}" for p in to_delete)
+        self._confirm_and_delete(to_delete, ds)
+
+    # ---- quick actions (keep latest always) ----
+    def on_delete_this_set_keep_latest(self):
+        ds = self._current_set()
+        if not ds:
+            messagebox.showinfo("No set selected", "Select a duplicate set on the left first.")
+            return
+        keeper = ds.keeper.path
+        to_delete = [f.path for f in ds.files if f.path != keeper]
+        if not to_delete:
+            messagebox.showinfo("Nothing to delete", "This set only has one file.")
+            return
+        self._confirm_and_delete(to_delete, ds)
+
+    def on_delete_all_sets_keep_latest(self):
+        if not self.dup_sets:
+            messagebox.showinfo("Nothing to delete", "No duplicate sets loaded.")
+            return
+        plan = []
+        for ds in list(self.dup_sets):
+            keeper = ds.keeper.path
+            plan.extend([f.path for f in ds.files if f.path != keeper])
+        if not plan:
+            messagebox.showinfo("Nothing to delete", "No deletable files found.")
+            return
+        msg = f"You're about to delete {len(plan)} file(s) across {len(self.dup_sets)} set(s).\n\n"
+        msg += "The most recent file in each set will be kept.\n\n"
+        msg += "This cannot be undone" + (" (Recycle Bin)" if self.recycle_var.get() and SEND2TRASH_AVAILABLE else "") + ". Continue?"
+        if not messagebox.askyesno("Confirm deletion", msg, icon="warning"):
+            return
+        failures, deleted = [], 0
+        for path in plan:
+            try:
+                if self.recycle_var.get() and SEND2TRASH_AVAILABLE: send2trash(path)
+                else: os.remove(path)
+                deleted += 1
+                for ds in list(self.dup_sets):
+                    ds.files = [f for f in ds.files if f.path != path]
+            except Exception as e:
+                failures.append((path, str(e)))
+        self.dup_sets = [ds for ds in self.dup_sets if len(ds.files) > 1]
+        self.current_set_index = None
+        self._rebuild_tree()
+        self._clear_detail()
+        self._set_quick_prune_enabled(bool(self.dup_sets), False)
+        self.status_label.config(text=f"Deleted {deleted} file(s)." + (f" {len(failures)} failed." if failures else ""))
+        if failures:
+            messagebox.showwarning("Some deletions failed", "\n".join(f"• {p} — {err}" for p, err in failures))
+
+    # ---- internal delete helper ----
+    def _confirm_and_delete(self, paths: List[str], ds: DuplicateSet):
+        msg = "You're about to delete:\n\n" + "\n".join(f"• {p}" for p in paths)
         msg += "\n\nThis cannot be undone" + (" (Recycle Bin)" if self.recycle_var.get() and SEND2TRASH_AVAILABLE else "") + ". Continue?"
         if not messagebox.askyesno("Confirm deletion", msg, icon="warning"):
             return
-
         failures, deleted = [], 0
-        for p in to_delete:
+        for p in paths:
             try:
                 if self.recycle_var.get() and SEND2TRASH_AVAILABLE: send2trash(p)
                 else: os.remove(p)
@@ -493,17 +663,17 @@ class DuplicateMediaFocusedApp:
                 ds.files = [f for f in ds.files if f.path != p]
             except Exception as e:
                 failures.append((p, str(e)))
-
         if len(ds.files) <= 1:
             try: self.dup_sets.remove(ds)
             except Exception: pass
             self.current_set_index = None
             self._rebuild_tree()
             self._clear_detail()
+            self._set_quick_prune_enabled(bool(self.dup_sets), False)
         else:
             self._render_detail(ds)
             self._rebuild_tree()
-
+            self._set_quick_prune_enabled(True, True)
         self.status_label.config(text=f"Deleted {deleted} file(s)." + (f" {len(failures)} failed." if failures else ""))
         if failures:
             messagebox.showwarning("Some deletions failed", "\n".join(f"• {p} — {err}" for p, err in failures))
@@ -515,6 +685,13 @@ class DuplicateMediaFocusedApp:
         self.root.destroy()
 
     # ---------- helpers ----------
+    def _set_quick_prune_enabled(self, any_sets: bool, have_selection: bool):
+        """Enable/disable the new quick-prune buttons."""
+        if self.btn_bulk_del_all:
+            (self.btn_bulk_del_all.state(["!disabled"]) if any_sets else self.btn_bulk_del_all.state(["disabled"]))
+        if self.btn_bulk_del_set:
+            (self.btn_bulk_del_set.state(["!disabled"]) if have_selection else self.btn_bulk_del_set.state(["disabled"]))
+
     def _current_set(self) -> Optional[DuplicateSet]:
         if self.current_set_index is None: return None
         return self.view_sets[self.current_set_index] if 0 <= self.current_set_index < len(self.view_sets) else None
@@ -526,6 +703,7 @@ class DuplicateMediaFocusedApp:
         self._clear_detail()
         self._update_counts(0, 0, 0)
         self.banner.config(text="")
+        self._set_quick_prune_enabled(False, False)
 
     def _clear_detail(self):
         for w in self.detail_container.winfo_children(): w.destroy()
@@ -564,9 +742,11 @@ class DuplicateMediaFocusedApp:
             self.tree.selection_set(first); self.tree.focus(first); self.tree.see(first)
             self.current_set_index = 0
             self._render_detail(self.view_sets[0])
+            self._set_quick_prune_enabled(True, True)
         else:
             self.current_set_index = None
             self._clear_detail()
+            self._set_quick_prune_enabled(False, False)
 
     def _render_detail(self, ds: DuplicateSet):
         self._clear_detail()
@@ -604,7 +784,7 @@ class DuplicateMediaFocusedApp:
         try:
             if is_previewable_image(path):
                 if not PIL_AVAILABLE:
-                    if path.lower().endswith((".png",".gif")):
+                    if path.lower().endswith((".png",".gif")):  # Tk fallback
                         return tk.PhotoImage(file=path)
                     return None
                 with Image.open(path) as im:
@@ -616,8 +796,8 @@ class DuplicateMediaFocusedApp:
                 cap = cv2.VideoCapture(path); ok, frame = cap.read(); cap.release()
                 if not ok or frame is None: return None
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                from PIL import Image
-                im = Image.fromarray(frame); im.thumbnail(size, Image.LANCZOS)
+                from PIL import Image as _Img
+                im = _Img.fromarray(frame); im.thumbnail(size, Image.LANCZOS)
                 return ImageTk.PhotoImage(im)
             return None
         except Exception:
